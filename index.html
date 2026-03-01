@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#f7f5f2" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Gate Scanner" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>Gate Scanner — Event Access</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,300;1,400&family=DM+Mono:wght@300;400&display=swap" rel="stylesheet" />
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+</head>
+<body>
+
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="3" y="3" width="7" height="7" stroke="currentColor" stroke-width="1.2"/>
+          <rect x="14" y="3" width="7" height="7" stroke="currentColor" stroke-width="1.2"/>
+          <rect x="3" y="14" width="7" height="7" stroke="currentColor" stroke-width="1.2"/>
+          <rect x="5" y="5" width="3" height="3" fill="currentColor"/>
+          <rect x="16" y="5" width="3" height="3" fill="currentColor"/>
+          <rect x="5" y="16" width="3" height="3" fill="currentColor"/>
+          <path d="M14 14h2v2h-2zM16 16h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z" fill="currentColor"/>
+        </svg>
+        <span class="brand-name">Gate Scanner</span>
+      </div>
+      <span class="header-meta">Staff Access Only</span>
+    </div>
+  </header>
+
+  <main class="app-main">
+
+    <!-- Gate Selection -->
+    <section class="section">
+      <p class="section-label">Gate</p>
+      <div class="select-wrapper">
+        <select id="gateSelect" class="gate-select">
+          <option value="Gate A">Gate A — Main Entrance</option>
+          <option value="Gate B">Gate B — North Wing</option>
+          <option value="Gate C">Gate C — VIP Access</option>
+        </select>
+        <svg class="select-chevron" viewBox="0 0 16 16" fill="none">
+          <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+        </svg>
+      </div>
+    </section>
+
+    <!-- Camera -->
+    <section class="section">
+      <p class="section-label">Camera</p>
+      <div class="camera-wrap" id="cameraFrame">
+        <div id="qr-reader"></div>
+        <!-- Elegant corner marks -->
+        <div class="corner-mark top-left"></div>
+        <div class="corner-mark top-right"></div>
+        <div class="corner-mark bottom-left"></div>
+        <div class="corner-mark bottom-right"></div>
+        <div class="scan-beam" id="scanBeam"></div>
+        <div class="camera-idle-text" id="cameraHint">
+          <svg viewBox="0 0 24 24" fill="none" width="clamp(24px, 7vw, 32px)" height="clamp(24px, 7vw, 32px)">
+            <rect x="3" y="3" width="5" height="5" rx="0.5" stroke="currentColor" stroke-width="1.2"/>
+            <rect x="16" y="3" width="5" height="5" rx="0.5" stroke="currentColor" stroke-width="1.2"/>
+            <rect x="3" y="16" width="5" height="5" rx="0.5" stroke="currentColor" stroke-width="1.2"/>
+            <path d="M16 16h2v2h-2zM18 18h2v2h-2zM16 20h2v2h-2zM20 16h2v2h-2z" fill="currentColor" opacity="0.5"/>
+          </svg>
+          <span>Tap Start Scanning</span>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button id="startBtn" class="btn-start" onclick="startScanner()">
+          Start Scanning
+        </button>
+        <button id="stopBtn" class="btn-stop" onclick="stopScanner()" style="display:none;">
+          Stop
+        </button>
+      </div>
+    </section>
+
+    <!-- Stats -->
+    <section class="section">
+      <p class="section-label">Session</p>
+      <div class="stats-row">
+        <div class="stat-cell">
+          <span class="stat-val valid-col" id="statValid">0</span>
+          <span class="stat-name">Admitted</span>
+        </div>
+        <div class="stat-sep"></div>
+        <div class="stat-cell">
+          <span class="stat-val used-col" id="statUsed">0</span>
+          <span class="stat-name">Duplicate</span>
+        </div>
+        <div class="stat-sep"></div>
+        <div class="stat-cell">
+          <span class="stat-val invalid-col" id="statInvalid">0</span>
+          <span class="stat-name">Rejected</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Log -->
+    <section class="section">
+      <p class="section-label">Recent</p>
+      <ul class="scan-log" id="scanLog">
+        <li class="log-empty">No scans recorded yet</li>
+      </ul>
+    </section>
+
+  </main>
+
+  <!-- Result Popup -->
+  <div class="popup-backdrop" id="popupOverlay" onclick="closePopup()">
+    <div class="popup-card" id="popupPanel" onclick="event.stopPropagation()">
+      <div class="popup-icon-wrap" id="popupIconWrap">
+        <span class="popup-icon" id="popupIcon">✓</span>
+      </div>
+      <p class="popup-headline" id="popupStatus">Valid</p>
+      <p class="popup-name" id="popupName"></p>
+      <p class="popup-sub" id="popupType"></p>
+      <p class="popup-sub" id="popupTime"></p>
+      <p class="popup-gate" id="popupGate"></p>
+      <div class="popup-progress"><div class="popup-progress-fill" id="timerFill"></div></div>
+      <button class="popup-dismiss" onclick="closePopup()">Dismiss</button>
+    </div>
+  </div>
+
+  <!-- Verifying Overlay -->
+  <div class="verifying-overlay" id="loadingOverlay">
+    <div class="verifying-inner">
+      <div class="verifying-ring"></div>
+      <span>Verifying</span>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="scanner.js"></script>
+</body>
+</html>
