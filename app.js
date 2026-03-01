@@ -166,27 +166,47 @@ function goBack() {
 // ── CAMERA ─────────────────────────────────────────────
 
 async function startCamera() {
-  S.scanner = new Html5Qrcode('qr-reader');
-  try {
-    const cams = await Html5Qrcode.getCameras();
-    if (!cams?.length) throw new Error('No camera found');
+  // Only scan QR_CODE format — skipping barcodes/etc makes it 3x faster
+  S.scanner = new Html5Qrcode('qr-reader', {
+    formatsToSupport: [ Html5QrcodeSupportedFormats.QR_CODE ],
+    verbose: false,
+  });
 
-    const cam = cams.find(c => /back|rear|environment/i.test(c.label)) || cams[0];
+  const config = {
+    fps: 30,                              // high fps = catches QR almost instantly
+    qrbox: (w, h) => {                   // 80% of viewport = large scan area
+      const s = Math.floor(Math.min(w, h) * 0.8);
+      return { width: s, height: s };
+    },
+    aspectRatio: 1.0,
+    disableFlip: false,
+    videoConstraints: {
+      facingMode: { ideal: 'environment' },
+      width:  { ideal: 1920, min: 640 },
+      height: { ideal: 1080, min: 480 },
+    },
+  };
 
-    await S.scanner.start(
-      cam.id,
-      { fps: 12, qrbox: { width: 220, height: 220 }, aspectRatio: 1.0 },
-      onScan,
-      () => {}
-    );
-
+  // Try environment (rear) camera first, fallback to any camera
+  const tryStart = async (constraint) => {
+    await S.scanner.start(constraint, config, onScan, () => {});
     document.getElementById('camWrap').classList.add('scanning');
+  };
 
-  } catch (err) {
-    document.getElementById('camIdle').innerHTML =
-      `<span style="color:var(--red-mid);font-size:.72rem;padding:20px;text-align:center;line-height:1.6;">
-        Camera error:<br>${err.message}
-       </span>`;
+  try {
+    await tryStart({ facingMode: 'environment' });
+  } catch (_) {
+    try {
+      const cams = await Html5Qrcode.getCameras();
+      if (!cams?.length) throw new Error('No camera found on this device.');
+      await tryStart(cams[0].id);
+    } catch (err) {
+      document.getElementById('camIdle').innerHTML =
+        `<span style="color:var(--red-mid);font-size:.72rem;padding:20px;text-align:center;line-height:1.7;">
+          Camera unavailable<br><br>${err.message}<br><br>
+          Ensure HTTPS and camera permission granted.
+         </span>`;
+    }
   }
 }
 
