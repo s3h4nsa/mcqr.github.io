@@ -460,7 +460,9 @@ function openPopup(type, icon, status, rows) {
 
 function closePopup() {
   document.getElementById('popupOverlay').classList.remove('show');
-  // Restart camera only if not manually paused
+  // Reset scan state so next QR works
+  S.locked   = false;
+  S.lastSeen = null;
   if (!S.paused) {
     startCamera();
   }
