@@ -178,6 +178,7 @@ async function startCamera() {
     video.play().then(() => {
       overlay.classList.add('hide');
       vf.classList.add('on');
+      document.getElementById('scanBar').classList.add('scanning');
       initDecoder();
     }).catch(err => setMsg('Video play failed: ' + err.message, true));
   });
@@ -193,6 +194,7 @@ function stopCamera() {
   const video = document.getElementById('camVideo');
   video.srcObject = null;
   document.getElementById('viewfinder').classList.remove('on');
+  document.getElementById('scanBar').classList.remove('scanning');
   document.getElementById('vfOverlay').classList.remove('hide');
   setMsg('Starting camera…');
 }
@@ -226,23 +228,26 @@ async function initDecoder() {
 }
 
 // ── Native BarcodeDetector loop ───────────────────────────────
-// Runs on every animation frame (~60fps). The OS decodes in a separate
-// thread so it never blocks the UI — identical to the iPhone camera.
+// BarcodeDetector.detect() is async. We use a flag so we never fire
+// a second detect() call while one is already running — this was the
+// main cause of slowness (calls piling up in a queue).
 
-async function nativeLoop() {
+function nativeLoop() {
   const video = document.getElementById('camVideo');
+  let detecting = false;
 
-  async function tick() {
-    if (!S.stream) return;   // camera stopped
+  function tick() {
+    if (!S.stream) return;
 
-    try {
-      if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        const codes = await S.detector.detect(video);
-        if (codes.length > 0) {
-          onQRFound(codes[0].rawValue);
-        }
-      }
-    } catch (e) { /* ignore per-frame decode errors */ }
+    if (!detecting && video.readyState === video.HAVE_ENOUGH_DATA) {
+      detecting = true;
+      S.detector.detect(video)
+        .then(codes => {
+          if (codes.length > 0) onQRFound(codes[0].rawValue);
+        })
+        .catch(() => {})
+        .finally(() => { detecting = false; });
+    }
 
     S.rafId = requestAnimationFrame(tick);
   }
@@ -251,29 +256,34 @@ async function nativeLoop() {
 }
 
 // ── jsQR fallback loop ────────────────────────────────────────
-// Draws each frame to a hidden canvas, reads pixel data, feeds to jsQR.
+// Scans at 50% of video resolution — 4x fewer pixels to process,
+// still more than enough to decode a QR code held at normal distance.
 
 function jsqrLoop() {
   const video  = document.getElementById('camVideo');
   const canvas = document.getElementById('camCanvas');
-  const ctx    = canvas.getContext('2d');
+  const ctx    = canvas.getContext('2d', { willReadFrequently: true });
+
+  // Target decode size — 400px is plenty for a QR held ~20cm from phone
+  const TARGET = 400;
 
   function tick() {
     if (!S.stream) return;
 
     if (video.readyState === video.HAVE_ENOUGH_DATA) {
-      // Match canvas to actual video dimensions
-      if (canvas.width !== video.videoWidth) {
-        canvas.width  = video.videoWidth;
-        canvas.height = video.videoHeight;
-      }
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const code = jsQR(img.data, img.width, img.height, {
-        inversionAttempts: 'dontInvert',   // faster — don't check inverted QR
-      });
-      if (code) {
-        onQRFound(code.data);
+      const vw = video.videoWidth, vh = video.videoHeight;
+      if (vw && vh) {
+        // Scale down to TARGET along the shorter axis
+        const scale = TARGET / Math.min(vw, vh);
+        const w = Math.round(vw * scale);
+        const h = Math.round(vh * scale);
+
+        if (canvas.width !== w) { canvas.width = w; canvas.height = h; }
+
+        ctx.drawImage(video, 0, 0, w, h);
+        const img  = ctx.getImageData(0, 0, w, h);
+        const code = jsQR(img.data, w, h, { inversionAttempts: 'dontInvert' });
+        if (code) onQRFound(code.data);
       }
     }
 
@@ -334,6 +344,7 @@ function verify(rawNIC) {
   refreshStats();
   beep('valid');
   flashVF('green');
+  flashBar('green');
   pushLog('valid', person.name || rawNIC, rawNIC, time);
   S.log.push({ type:'valid', nic:rawNIC, name:person.name, gate:S.gate, ts:now.toISOString() });
   openPopup('valid', '✓', 'Admitted', buildRows(person, rawNIC, S.gate, time));
@@ -359,6 +370,27 @@ function flashVF(color) {
   void vf.offsetWidth;   // force reflow
   vf.classList.add('flash-' + color);
   setTimeout(() => vf.classList.remove('flash-' + color), 400);
+}
+
+// ── Scan bar flash ───────────────────────────────────────────
+
+function flashBar(color) {
+  const bar  = document.getElementById('scanBar');
+  const fill = document.getElementById('scanBarFill');
+  const colorMap = { green: 'var(--green-b)', amber: 'var(--amber-b)', red: 'var(--red-b)' };
+  bar.classList.remove('scanning');
+  fill.style.background = colorMap[color] || colorMap.green;
+  fill.style.left   = '0';
+  fill.style.width  = '100%';
+  fill.style.transition = 'none';
+  // After 400ms flash, go back to sweeping
+  setTimeout(() => {
+    fill.style.background = '';
+    fill.style.left  = '';
+    fill.style.width = '';
+    fill.style.transition = '';
+    bar.classList.add('scanning');
+  }, 400);
 }
 
 // ── Popup ────────────────────────────────────────────────────
