@@ -13,10 +13,11 @@
 const S = {
   tickets:   new Map(),
   scanned:   new Map(),
-  gate:      'Gate A',
+  gate:      'Main',
   stats:     { valid:0, dupe:0, invalid:0 },
   log:       [],
   locked:    false,
+  paused:    false,
   popTimer:  null,
   stream:    null,        // MediaStream
   rafId:     null,        // requestAnimationFrame handle
@@ -120,7 +121,6 @@ document.getElementById('gatePills').addEventListener('click', e => {
 // ── Screen transitions ───────────────────────────────────────
 
 function startApp() {
-  document.getElementById('topGate').textContent    = S.gate;
   document.getElementById('topTickets').textContent =
     S.tickets.size + ' ticket' + (S.tickets.size !== 1 ? 's' : '');
   document.getElementById('setupScreen').classList.remove('active');
@@ -315,7 +315,7 @@ function verify(rawNIC) {
     S.stats.invalid++;
     refreshStats();
     beep('invalid');
-    flashVF('red');
+    flashVF('err');
     pushLog('invalid', 'Not registered', rawNIC, time);
     S.log.push({ type:'invalid', nic:rawNIC, name:'', gate:S.gate, ts:now.toISOString() });
     openPopup('invalid', '✕', 'Not Registered', [
@@ -330,7 +330,7 @@ function verify(rawNIC) {
     S.stats.dupe++;
     refreshStats();
     beep('dupe');
-    flashVF('amber');
+    flashVF('warn');
     pushLog('dupe', person.name || rawNIC, rawNIC, time);
     S.log.push({ type:'dupe', nic:rawNIC, name:person.name, gate:S.gate, ts:now.toISOString() });
     openPopup('dupe', '⚠', 'Already Scanned', buildRows(person, rawNIC, prev.gate, 'First entry: ' + prev.time));
@@ -341,7 +341,7 @@ function verify(rawNIC) {
   S.stats.valid++;
   refreshStats();
   beep('valid');
-  flashVF('green');
+  flashVF('ok');
   pushLog('valid', person.name || rawNIC, rawNIC, time);
   S.log.push({ type:'valid', nic:rawNIC, name:person.name, gate:S.gate, ts:now.toISOString() });
   openPopup('valid', '✓', 'Admitted', buildRows(person, rawNIC, S.gate, time));
@@ -363,16 +363,58 @@ function buildRows(p, nic, gate, time) {
 
 function flashVF(color) {
   const vf = document.getElementById('viewfinder');
-  vf.classList.remove('flash-green','flash-amber','flash-red');
+  vf.classList.remove('flash-ok','flash-warn','flash-err');
   void vf.offsetWidth;   // force reflow
   vf.classList.add('flash-' + color);
   setTimeout(() => vf.classList.remove('flash-' + color), 400);
+}
+
+// ── Pause / Resume ───────────────────────────────────────────
+
+function pauseScan() {
+  cancelAnimationFrame(S.rafId);
+  S.rafId = null;
+  document.getElementById('pauseBtn').dataset.state = 'paused';
+  document.getElementById('pauseBtn').innerHTML = `
+    <svg viewBox="0 0 24 24" fill="none" width="16" height="16">
+      <polygon points="5,3 19,12 5,21" fill="currentColor"/>
+    </svg>
+    Resume`;
+  document.getElementById('viewfinder').classList.add('paused');
+}
+
+function resumeScan() {
+  if (S.rafId) return; // already running
+  document.getElementById('pauseBtn').dataset.state = 'scanning';
+  document.getElementById('pauseBtn').innerHTML = `
+    <svg viewBox="0 0 24 24" fill="none" width="16" height="16">
+      <rect x="6" y="4" width="4" height="16" rx="1" fill="currentColor"/>
+      <rect x="14" y="4" width="4" height="16" rx="1" fill="currentColor"/>
+    </svg>
+    Pause`;
+  document.getElementById('viewfinder').classList.remove('paused');
+  // Restart whichever loop was active
+  if (S.detector) nativeLoop();
+  else jsqrLoop();
+}
+
+function togglePause() {
+  if (S.rafId) {
+    // currently scanning — pause it
+    S.paused = true;
+    pauseScan();
+  } else {
+    // currently paused — resume it
+    S.paused = false;
+    resumeScan();
+  }
 }
 
 // ── Popup ────────────────────────────────────────────────────
 
 function openPopup(type, icon, status, rows) {
   clearTimeout(S.popTimer);
+  pauseScan();
 
   document.getElementById('popupIcon').textContent   = icon;
   document.getElementById('popupStatus').textContent = status;
@@ -389,7 +431,7 @@ function openPopup(type, icon, status, rows) {
   const fill = document.getElementById('popupFill');
   fill.classList.remove('running');
   fill.style.width = '100%';
-  void fill.offsetWidth;
+  void fill.offsetWidth;   // force reflow
   fill.classList.add('running');
 
   S.popTimer = setTimeout(closePopup, 4000);
@@ -398,6 +440,7 @@ function openPopup(type, icon, status, rows) {
 function closePopup() {
   clearTimeout(S.popTimer);
   document.getElementById('popupOverlay').classList.remove('show');
+  if (!S.paused) resumeScan();
 }
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePopup(); });
@@ -409,11 +452,12 @@ function pushLog(type, name, nic, time) {
   const empty = list.querySelector('.log-empty');
   if (empty) empty.remove();
 
+  const pillLabel = type === 'valid' ? 'In' : type === 'dupe' ? 'Dupe' : 'Bad';
   const li = document.createElement('li');
   li.className = 'log-row ' + type;
   li.innerHTML =
-    `<div class="log-stripe"></div>
-     <div class="log-text">
+    `<span class="log-pill">${pillLabel}</span>
+     <div class="log-info">
        <span class="log-name">${esc(name)}</span>
        <span class="log-nic">${esc(nic)}</span>
      </div>
@@ -427,9 +471,7 @@ function pushLog(type, name, nic, time) {
 // ── Stats ────────────────────────────────────────────────────
 
 function refreshStats() {
-  bump('ssIn',   S.stats.valid);   bump('tcIn',   S.stats.valid);
-  bump('ssDupe', S.stats.dupe);    bump('tcDupe', S.stats.dupe);
-  bump('ssBad',  S.stats.invalid); bump('tcBad',  S.stats.invalid);
+  bump('sbIn',   S.stats.valid);   bump('sbDupe', S.stats.dupe);    bump('sbBad',  S.stats.invalid); bump('tcBad',  S.stats.invalid);
 }
 
 function bump(id, val) {
