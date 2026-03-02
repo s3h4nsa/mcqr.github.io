@@ -1,158 +1,130 @@
 /**
  * Event Check-In — Offline NIC Scanner
- * Reads NIC from QR → looks up in uploaded CSV → shows person details
+ *
+ * Camera strategy (fastest first):
+ *   1. BarcodeDetector API  — native OS decoder (same engine as iPhone/Android
+ *                             camera app). Works on Chrome Android, Safari iOS 17+.
+ *                             Sub-100ms detection.
+ *   2. jsQR fallback        — canvas pixel decoder for older browsers.
+ *                             Still fast; ~200-400ms per frame.
  */
 
-// ── State ───────────────────────────────────────────────────
+// ── State ────────────────────────────────────────────────────
 const S = {
-  tickets:  new Map(),   // nic_lowercase → { nic, name, email, phone, slip }
-  scanned:  new Map(),   // nic_lowercase → { time, gate }
-  gate:     'Gate A',
-  stats:    { valid: 0, dupe: 0, invalid: 0 },
-  log:      [],
-  locked:   false,
-  popTimer: null,
-  scanner:  null,
-  audioCtx: null,
+  tickets:   new Map(),
+  scanned:   new Map(),
+  gate:      'Gate A',
+  stats:     { valid:0, dupe:0, invalid:0 },
+  log:       [],
+  locked:    false,
+  popTimer:  null,
+  stream:    null,        // MediaStream
+  rafId:     null,        // requestAnimationFrame handle
+  detector:  null,        // BarcodeDetector instance (if supported)
+  audioCtx:  null,
 };
 
-// ── CSV UPLOAD ───────────────────────────────────────────────
+// ── CSV ──────────────────────────────────────────────────────
 
 document.getElementById('csvInput').addEventListener('change', function () {
   const file = this.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload  = function (e) { parseCSV(e.target.result, file.name); };
-  reader.onerror = function ()  { alert('Could not read file. Try again.'); };
-  reader.readAsText(file, 'UTF-8');
+  const r = new FileReader();
+  r.onload  = e => parseCSV(e.target.result, file.name);
+  r.onerror = () => alert('Could not read the file. Please try again.');
+  r.readAsText(file, 'UTF-8');
 });
 
-function parseCSV(text, filename) {
-  // Remove BOM
-  text = text.replace(/^\uFEFF/, '');
+function parseCSV(raw, filename) {
+  const text    = raw.replace(/^\uFEFF/, '');          // strip BOM
+  const lines   = text.trim().split(/\r?\n/);
+  if (lines.length < 2) { alert('CSV is empty.'); return; }
 
-  const lines = text.trim().split(/\r?\n/);
-  if (lines.length < 2) {
-    alert('File looks empty — make sure it has a header row and at least one ticket.');
-    return;
-  }
+  const headers = lines[0].split(',')
+    .map(h => h.replace(/"/g,'').trim().toLowerCase());
 
-  // Normalise headers
-  const headers = lines[0]
-    .split(',')
-    .map(function (h) { return h.replace(/"/g, '').trim().toLowerCase(); });
-
-  console.log('[CSV] Headers:', headers);
-
-  // Find columns — works with your exact sheet column names
-  var col = {
-    nic:   col_find(headers, ['nic number', 'nic', 'national id']),
-    name:  col_find(headers, ['full name', 'name']),
-    email: col_find(headers, ['email address', 'email']),
-    phone: col_find(headers, ['contact number', 'contact', 'phone', 'mobile']),
-    slip:  col_find(headers, ['payment slip number', 'payment slip', 'slip number', 'slip']),
+  const col = {
+    nic:   findCol(headers, ['nic number','nic','national id']),
+    name:  findCol(headers, ['full name','name']),
+    email: findCol(headers, ['email address','email']),
+    phone: findCol(headers, ['contact number','contact','phone','mobile']),
+    slip:  findCol(headers, ['payment slip number','payment slip','slip number','slip']),
   };
 
-  console.log('[CSV] Column map:', col);
-
   if (col.nic === -1) {
-    alert(
-      'Could not find the NIC Number column.\n\n' +
-      'Columns found: ' + headers.join(', ') + '\n\n' +
-      'Make sure the sheet has a column called "NIC Number".'
-    );
+    alert('Cannot find "NIC Number" column.\nHeaders: ' + headers.join(', '));
     return;
   }
 
   S.tickets.clear();
-  var count = 0;
-
-  for (var i = 1; i < lines.length; i++) {
-    var line = lines[i].trim();
-    if (!line) continue;
-
-    var cells = csv_split(line);
-    var nic   = col.nic >= 0 ? (cells[col.nic] || '').trim() : '';
+  let count = 0;
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const c   = csvSplit(lines[i]);
+    const nic = (c[col.nic] || '').trim();
     if (!nic) continue;
-
     S.tickets.set(nic.toLowerCase(), {
-      nic:   nic,
-      name:  col.name  >= 0 ? (cells[col.name]  || '').trim() : '',
-      email: col.email >= 0 ? (cells[col.email] || '').trim() : '',
-      phone: col.phone >= 0 ? (cells[col.phone] || '').trim() : '',
-      slip:  col.slip  >= 0 ? (cells[col.slip]  || '').trim() : '',
+      nic,
+      name:  col.name  >= 0 ? (c[col.name]  || '').trim() : '',
+      email: col.email >= 0 ? (c[col.email] || '').trim() : '',
+      phone: col.phone >= 0 ? (c[col.phone] || '').trim() : '',
+      slip:  col.slip  >= 0 ? (c[col.slip]  || '').trim() : '',
     });
     count++;
   }
 
-  console.log('[CSV] Loaded', count, 'tickets. Sample:', [...S.tickets.entries()].slice(0,2));
-
-  if (count === 0) {
-    alert('No tickets found. Check that the NIC Number column has values.');
-    return;
-  }
+  if (!count) { alert('No tickets found. Check NIC Number column has data.'); return; }
 
   // Update UI
-  var btn = document.getElementById('uploadBtnText').parentElement;
-  btn.classList.add('done');
-  document.getElementById('uploadBtnText').textContent = '✓  ' + filename;
+  const btn = document.getElementById('uploadBtnText');
+  btn.textContent = '✓  ' + filename;
+  btn.parentElement.classList.add('done');
 
-  var loaded = document.getElementById('csvLoaded');
-  loaded.classList.remove('hidden');
+  document.getElementById('csvLoaded').classList.remove('hidden');
   document.getElementById('csvCountText').textContent = count + ' ticket' + (count !== 1 ? 's' : '') + ' loaded';
   document.getElementById('csvFileName').textContent  = filename;
-
   document.getElementById('startBtn').disabled = false;
+
+  console.log('[CSV] Loaded', count, 'tickets');
 }
 
-function col_find(headers, names) {
-  for (var n = 0; n < names.length; n++) {
-    for (var h = 0; h < headers.length; h++) {
-      if (headers[h] === names[n] || headers[h].indexOf(names[n]) !== -1) return h;
-    }
-  }
+function findCol(headers, names) {
+  for (const n of names)
+    for (let i = 0; i < headers.length; i++)
+      if (headers[i] === n || headers[i].includes(n)) return i;
   return -1;
 }
 
-// Proper CSV line parser — handles quoted fields
-function csv_split(line) {
-  var result = [], cur = '', inQ = false;
-  for (var i = 0; i < line.length; i++) {
-    var c = line[i];
-    if (c === '"') {
-      if (inQ && line[i + 1] === '"') { cur += '"'; i++; }
-      else inQ = !inQ;
-    } else if (c === ',' && !inQ) {
-      result.push(cur.trim());
-      cur = '';
-    } else {
-      cur += c;
-    }
+function csvSplit(line) {
+  const out = []; let cur = '', q = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') { if (q && line[i+1]==='"'){cur+='"';i++;} else q=!q; }
+    else if (c === ',' && !q) { out.push(cur.trim()); cur=''; }
+    else cur += c;
   }
-  result.push(cur.trim());
-  return result;
+  out.push(cur.trim());
+  return out;
 }
 
-// ── GATE PILLS ───────────────────────────────────────────────
+// ── Gate pills ───────────────────────────────────────────────
 
-document.getElementById('gatePills').addEventListener('click', function (e) {
-  var pill = e.target.closest('.gpill');
-  if (!pill) return;
-  document.querySelectorAll('.gpill').forEach(function (p) { p.classList.remove('active'); });
-  pill.classList.add('active');
-  S.gate = pill.dataset.gate;
+document.getElementById('gatePills').addEventListener('click', e => {
+  const p = e.target.closest('.gpill');
+  if (!p) return;
+  document.querySelectorAll('.gpill').forEach(x => x.classList.remove('active'));
+  p.classList.add('active');
+  S.gate = p.dataset.gate;
 });
 
-// ── SCREEN TRANSITIONS ───────────────────────────────────────
+// ── Screen transitions ───────────────────────────────────────
 
 function startApp() {
-  document.getElementById('topGate').textContent   = S.gate;
+  document.getElementById('topGate').textContent    = S.gate;
   document.getElementById('topTickets').textContent =
     S.tickets.size + ' ticket' + (S.tickets.size !== 1 ? 's' : '');
-
   document.getElementById('setupScreen').classList.remove('active');
   document.getElementById('scanScreen').classList.add('active');
-
   startCamera();
 }
 
@@ -162,162 +134,213 @@ function goBack() {
   document.getElementById('setupScreen').classList.add('active');
 }
 
-// ── CAMERA ───────────────────────────────────────────────────
+// ── Camera ───────────────────────────────────────────────────
 
 async function startCamera() {
-  var vf = document.getElementById('viewfinder');
+  const video   = document.getElementById('camVideo');
+  const overlay = document.getElementById('vfOverlay');
+  const vf      = document.getElementById('viewfinder');
 
-  // Plain init — no format flags (they break in some versions of the lib)
-  S.scanner = new Html5Qrcode('qr-reader');
+  setMsg('Starting camera…');
 
-  var config = {
-    fps: 20,
-    /*
-      qrbox relative to the rendered video element.
-      We do this after a tiny delay so the DOM has measured its real size.
-    */
-    qrbox: { width: 200, height: 200 },
-    disableFlip: false,
+  // ── Request camera stream ─────────────────────────────────
+  // Ask for the highest resolution the rear camera can provide.
+  // Higher resolution = more pixels = QR codes decode faster & from farther.
+  const constraints = {
+    video: {
+      facingMode:  { ideal: 'environment' },
+      width:       { ideal: 1920 },
+      height:      { ideal: 1080 },
+    },
+    audio: false,
   };
 
-  // After element renders, update qrbox to be proportional
-  setTimeout(function () {
-    var w = vf.offsetWidth;
-    var h = vf.offsetHeight;
-    var size = Math.floor(Math.min(w, h) * 0.72);
-    config.qrbox = { width: size, height: size };
-    console.log('[CAM] viewfinder size:', w, 'x', h, '→ qrbox', size);
-  }, 100);
-
-  // Try 1: facingMode environment (rear camera — works on most Android/iOS)
   try {
-    await S.scanner.start(
-      { facingMode: 'environment' },
-      config,
-      onQRScan,
-      function () {}
-    );
-    vf.classList.add('on');
-    console.log('[CAM] Started with facingMode:environment');
-    return;
-  } catch (e1) {
-    console.warn('[CAM] facingMode:environment failed:', e1.message);
+    S.stream = await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (err) {
+    // Retry with minimal constraints (some browsers need it)
+    try {
+      S.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    } catch (err2) {
+      try {
+        S.stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      } catch (err3) {
+        setMsg('📷 Camera blocked\n\nAllow camera access and reload.', true);
+        return;
+      }
+    }
   }
 
-  // Try 2: list cameras, pick rear by label, fallback to last (usually rear)
-  try {
-    var cams = await Html5Qrcode.getCameras();
-    console.log('[CAM] Available cameras:', cams.map(function(c){ return c.label; }));
+  video.srcObject = S.stream;
 
-    if (!cams || cams.length === 0) throw new Error('No cameras detected.');
+  // Wait for video to actually be playing before we start decoding
+  video.addEventListener('loadedmetadata', () => {
+    video.play().then(() => {
+      overlay.classList.add('hide');
+      vf.classList.add('on');
+      initDecoder();
+    }).catch(err => setMsg('Video play failed: ' + err.message, true));
+  });
+}
 
-    // Find rear camera by label; if not found use the last one (rear on phones)
-    var chosen = cams[cams.length - 1];
-    for (var i = 0; i < cams.length; i++) {
-      if (/back|rear|environment/i.test(cams[i].label)) {
-        chosen = cams[i];
-        break;
+function stopCamera() {
+  cancelAnimationFrame(S.rafId);
+  S.rafId = null;
+  if (S.stream) {
+    S.stream.getTracks().forEach(t => t.stop());
+    S.stream = null;
+  }
+  const video = document.getElementById('camVideo');
+  video.srcObject = null;
+  document.getElementById('viewfinder').classList.remove('on');
+  document.getElementById('vfOverlay').classList.remove('hide');
+  setMsg('Starting camera…');
+}
+
+// ── Decoder init ─────────────────────────────────────────────
+
+async function initDecoder() {
+  // Try native BarcodeDetector first
+  if ('BarcodeDetector' in window) {
+    try {
+      const supported = await BarcodeDetector.getSupportedFormats();
+      if (supported.includes('qr_code')) {
+        S.detector = new BarcodeDetector({ formats: ['qr_code'] });
+        console.log('[SCAN] Using native BarcodeDetector ✓');
+        nativeLoop();
+        return;
+      }
+    } catch (e) {
+      console.warn('[SCAN] BarcodeDetector init failed:', e.message);
+    }
+  }
+
+  // Fallback: jsQR via canvas
+  if (typeof jsQR === 'function') {
+    console.log('[SCAN] BarcodeDetector not available — using jsQR fallback');
+    jsqrLoop();
+    return;
+  }
+
+  setMsg('No QR decoder available.\nTry Chrome or Safari 17+.', true);
+}
+
+// ── Native BarcodeDetector loop ───────────────────────────────
+// Runs on every animation frame (~60fps). The OS decodes in a separate
+// thread so it never blocks the UI — identical to the iPhone camera.
+
+async function nativeLoop() {
+  const video = document.getElementById('camVideo');
+
+  async function tick() {
+    if (!S.stream) return;   // camera stopped
+
+    try {
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        const codes = await S.detector.detect(video);
+        if (codes.length > 0) {
+          onQRFound(codes[0].rawValue);
+        }
+      }
+    } catch (e) { /* ignore per-frame decode errors */ }
+
+    S.rafId = requestAnimationFrame(tick);
+  }
+
+  S.rafId = requestAnimationFrame(tick);
+}
+
+// ── jsQR fallback loop ────────────────────────────────────────
+// Draws each frame to a hidden canvas, reads pixel data, feeds to jsQR.
+
+function jsqrLoop() {
+  const video  = document.getElementById('camVideo');
+  const canvas = document.getElementById('camCanvas');
+  const ctx    = canvas.getContext('2d');
+
+  function tick() {
+    if (!S.stream) return;
+
+    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+      // Match canvas to actual video dimensions
+      if (canvas.width !== video.videoWidth) {
+        canvas.width  = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(img.data, img.width, img.height, {
+        inversionAttempts: 'dontInvert',   // faster — don't check inverted QR
+      });
+      if (code) {
+        onQRFound(code.data);
       }
     }
 
-    await S.scanner.start(chosen.id, config, onQRScan, function () {});
-    vf.classList.add('on');
-    console.log('[CAM] Started with camera:', chosen.label || chosen.id);
-    return;
-  } catch (e2) {
-    console.error('[CAM] All start attempts failed:', e2.message);
-    document.getElementById('vfIdle').innerHTML =
-      '<div style="padding:16px;line-height:1.7;text-align:center;">' +
-        '<div style="font-size:1.5rem;margin-bottom:6px;">📷</div>' +
-        '<div style="color:#ff9999;font-size:.72rem;font-weight:300;">' + esc(e2.message) + '</div>' +
-        '<div style="color:rgba(255,255,255,.4);font-size:.62rem;margin-top:6px;">' +
-          'Allow camera access &amp; refresh' +
-        '</div>' +
-      '</div>';
+    S.rafId = requestAnimationFrame(tick);
   }
+
+  S.rafId = requestAnimationFrame(tick);
 }
 
-async function stopCamera() {
-  if (!S.scanner) return;
-  try {
-    // getState: 0=UNKNOWN,1=NOT_STARTED,2=SCANNING,3=PAUSED
-    if (S.scanner.getState() === 2) {
-      await S.scanner.stop();
-    }
-    S.scanner.clear();
-  } catch (e) {
-    console.warn('[CAM] Stop error:', e.message);
-  }
-  S.scanner = null;
-  document.getElementById('viewfinder').classList.remove('on');
-}
+// ── QR found ─────────────────────────────────────────────────
 
-// ── QR SCAN CALLBACK ─────────────────────────────────────────
-
-function onQRScan(raw) {
+function onQRFound(raw) {
   if (S.locked) return;
-
   S.locked = true;
-  setTimeout(function () { S.locked = false; }, 2500);
+  setTimeout(() => S.locked = false, 2500);
 
-  var nic = raw.trim();
-  console.log('[SCAN] Raw value:', nic);
+  const nic = raw.trim();
+  console.log('[SCAN] Found:', nic);
   verify(nic);
 }
 
-// ── LOOKUP & VERIFY ──────────────────────────────────────────
+// ── Lookup & verify ───────────────────────────────────────────
 
 function verify(rawNIC) {
-  var key    = rawNIC.toLowerCase();
-  var person = S.tickets.get(key);
-  var now    = new Date();
-  var time   = now.toLocaleTimeString('en-GB', {
-    hour: '2-digit', minute: '2-digit', second: '2-digit'
-  });
+  const key    = rawNIC.toLowerCase();
+  const person = S.tickets.get(key);
+  const now    = new Date();
+  const time   = now.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
 
-  // ── NOT IN LIST ──────────────────────────────────────────
   if (!person) {
     S.stats.invalid++;
     refreshStats();
     beep('invalid');
+    flashVF('red');
     pushLog('invalid', 'Not registered', rawNIC, time);
     S.log.push({ type:'invalid', nic:rawNIC, name:'', gate:S.gate, ts:now.toISOString() });
-
     openPopup('invalid', '✕', 'Not Registered', [
-      { l: 'NIC Scanned', v: rawNIC, mono: true },
-      { l: 'Status',      v: 'Not found in ticket list', cls: 'err' },
+      { l:'NIC Scanned', v:rawNIC, mono:true },
+      { l:'Status', v:'Not found in ticket list', cls:'err' },
     ]);
     return;
   }
 
-  // ── ALREADY SCANNED ──────────────────────────────────────
-  var prev = S.scanned.get(key);
+  const prev = S.scanned.get(key);
   if (prev) {
     S.stats.dupe++;
     refreshStats();
     beep('dupe');
+    flashVF('amber');
     pushLog('dupe', person.name || rawNIC, rawNIC, time);
     S.log.push({ type:'dupe', nic:rawNIC, name:person.name, gate:S.gate, ts:now.toISOString() });
-
-    openPopup('dupe', '⚠', 'Already Scanned',
-      buildRows(person, rawNIC, prev.gate, 'First entry: ' + prev.time));
+    openPopup('dupe', '⚠', 'Already Scanned', buildRows(person, rawNIC, prev.gate, 'First entry: ' + prev.time));
     return;
   }
 
-  // ── VALID ────────────────────────────────────────────────
-  S.scanned.set(key, { time: time, gate: S.gate });
+  S.scanned.set(key, { time, gate: S.gate });
   S.stats.valid++;
   refreshStats();
   beep('valid');
+  flashVF('green');
   pushLog('valid', person.name || rawNIC, rawNIC, time);
   S.log.push({ type:'valid', nic:rawNIC, name:person.name, gate:S.gate, ts:now.toISOString() });
-
-  openPopup('valid', '✓', 'Admitted',
-    buildRows(person, rawNIC, S.gate, time));
+  openPopup('valid', '✓', 'Admitted', buildRows(person, rawNIC, S.gate, time));
 }
 
 function buildRows(p, nic, gate, time) {
-  var rows = [];
+  const rows = [];
   if (p.name)  rows.push({ l:'Name',   v:p.name });
   rows.push(   { l:'NIC',    v:nic,    mono:true });
   if (p.phone) rows.push({ l:'Phone',  v:p.phone, mono:true });
@@ -328,32 +351,37 @@ function buildRows(p, nic, gate, time) {
   return rows;
 }
 
-// ── POPUP ────────────────────────────────────────────────────
+// ── Viewfinder flash ─────────────────────────────────────────
+
+function flashVF(color) {
+  const vf = document.getElementById('viewfinder');
+  vf.classList.remove('flash-green','flash-amber','flash-red');
+  void vf.offsetWidth;   // force reflow
+  vf.classList.add('flash-' + color);
+  setTimeout(() => vf.classList.remove('flash-' + color), 400);
+}
+
+// ── Popup ────────────────────────────────────────────────────
 
 function openPopup(type, icon, status, rows) {
   clearTimeout(S.popTimer);
 
-  var box = document.getElementById('popupBox');
   document.getElementById('popupIcon').textContent   = icon;
   document.getElementById('popupStatus').textContent = status;
+  document.getElementById('popupDetails').innerHTML  = rows.map(r =>
+    `<div class="drow">
+      <span class="dlabel">${esc(r.l)}</span>
+      <span class="dvalue ${r.mono?'mono':''} ${r.cls||''}">${esc(r.v)}</span>
+    </div>`
+  ).join('');
 
-  // Build detail rows
-  document.getElementById('popupDetails').innerHTML = rows.map(function (r) {
-    var cls = 'dvalue' + (r.mono ? ' mono' : '') + (r.cls ? ' ' + r.cls : '');
-    return '<div class="drow">' +
-      '<span class="dlabel">' + esc(r.l) + '</span>' +
-      '<span class="' + cls + '">' + esc(r.v) + '</span>' +
-    '</div>';
-  }).join('');
-
-  box.className = 'popup-box ' + type;
+  document.getElementById('popupBox').className = 'popup-box ' + type;
   document.getElementById('popupOverlay').classList.add('show');
 
-  // Countdown bar
-  var fill = document.getElementById('popupFill');
+  const fill = document.getElementById('popupFill');
   fill.classList.remove('running');
   fill.style.width = '100%';
-  void fill.offsetWidth;    // force reflow
+  void fill.offsetWidth;
   fill.classList.add('running');
 
   S.popTimer = setTimeout(closePopup, 4000);
@@ -364,47 +392,40 @@ function closePopup() {
   document.getElementById('popupOverlay').classList.remove('show');
 }
 
-document.addEventListener('keydown', function (e) {
-  if (e.key === 'Escape') closePopup();
-});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePopup(); });
 
-// ── SCAN LOG ─────────────────────────────────────────────────
+// ── Scan log ─────────────────────────────────────────────────
 
 function pushLog(type, name, nic, time) {
-  var list  = document.getElementById('scanLog');
-  var empty = list.querySelector('.log-empty');
+  const list  = document.getElementById('scanLog');
+  const empty = list.querySelector('.log-empty');
   if (empty) empty.remove();
 
-  var li = document.createElement('li');
+  const li = document.createElement('li');
   li.className = 'log-row ' + type;
   li.innerHTML =
-    '<div class="log-stripe"></div>' +
-    '<div class="log-text">' +
-      '<span class="log-name">' + esc(name) + '</span>' +
-      '<span class="log-nic">'  + esc(nic)  + '</span>' +
-    '</div>' +
-    '<span class="log-time">' + esc(time) + '</span>';
-
+    `<div class="log-stripe"></div>
+     <div class="log-text">
+       <span class="log-name">${esc(name)}</span>
+       <span class="log-nic">${esc(nic)}</span>
+     </div>
+     <span class="log-time">${esc(time)}</span>`;
   list.insertBefore(li, list.firstChild);
 
-  // Trim to 60 entries
-  var all = list.querySelectorAll('.log-row');
+  const all = list.querySelectorAll('.log-row');
   if (all.length > 60) all[all.length - 1].remove();
 }
 
-// ── STATS ────────────────────────────────────────────────────
+// ── Stats ────────────────────────────────────────────────────
 
 function refreshStats() {
-  bump('ssIn',   S.stats.valid);
-  bump('tcIn',   S.stats.valid);
-  bump('ssDupe', S.stats.dupe);
-  bump('tcDupe', S.stats.dupe);
-  bump('ssBad',  S.stats.invalid);
-  bump('tcBad',  S.stats.invalid);
+  bump('ssIn',   S.stats.valid);   bump('tcIn',   S.stats.valid);
+  bump('ssDupe', S.stats.dupe);    bump('tcDupe', S.stats.dupe);
+  bump('ssBad',  S.stats.invalid); bump('tcBad',  S.stats.invalid);
 }
 
 function bump(id, val) {
-  var el = document.getElementById(id);
+  const el = document.getElementById(id);
   if (!el) return;
   el.textContent = val;
   el.classList.remove('flash');
@@ -412,70 +433,63 @@ function bump(id, val) {
   el.classList.add('flash');
 }
 
-// ── EXPORT ───────────────────────────────────────────────────
+// ── Export ───────────────────────────────────────────────────
 
 function exportCSV() {
   if (!S.log.length) { alert('No scans to export yet.'); return; }
-
-  var header = 'result,nic,name,gate,timestamp\n';
-  var rows   = S.log.map(function (r) {
-    return [r.type, qf(r.nic), qf(r.name), qf(r.gate), r.ts].join(',');
-  }).join('\n');
-
-  var blob = new Blob([header + rows], { type: 'text/csv' });
-  var url  = URL.createObjectURL(blob);
-  var a    = document.createElement('a');
-  a.href   = url;
-  a.download = 'checkin-' +
-    S.gate.toLowerCase().replace(/\s+/g, '-') + '-' +
-    new Date().toISOString().slice(0, 10) + '.csv';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  const rows = S.log.map(r => [r.type, qf(r.nic), qf(r.name), qf(r.gate), r.ts].join(','));
+  const blob = new Blob(['result,nic,name,gate,timestamp\n' + rows.join('\n')], { type:'text/csv' });
+  const a    = Object.assign(document.createElement('a'), {
+    href:     URL.createObjectURL(blob),
+    download: `checkin-${S.gate.toLowerCase().replace(/\s+/g,'-')}-${new Date().toISOString().slice(0,10)}.csv`,
+  });
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
 }
 
 function qf(v) {
-  if (!v) return '';
-  var s = String(v);
-  return /[,"\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  const s = String(v || '');
+  return /[,"\n]/.test(s) ? `"${s.replace(/"/g,'""')}"` : s;
 }
 
-// ── AUDIO ────────────────────────────────────────────────────
+// ── Audio ────────────────────────────────────────────────────
 
 function getAudio() {
-  if (!S.audioCtx)
-    S.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (!S.audioCtx) S.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   return S.audioCtx;
 }
 
 function beep(type) {
-  var sounds = {
+  const map = {
     valid:   { freqs:[880,1100], dur:.1,  wave:'sine',     vol:.28 },
-    dupe:    { freqs:[440,330],  dur:.14, wave:'triangle', vol:.24 },
-    invalid: { freqs:[220,180],  dur:.18, wave:'sawtooth', vol:.2  },
+    dupe:    { freqs:[440,330],  dur:.14, wave:'triangle', vol:.22 },
+    invalid: { freqs:[220,180],  dur:.18, wave:'sawtooth', vol:.18 },
   };
-  var s = sounds[type] || sounds.invalid;
+  const { freqs, dur, wave, vol } = map[type] || map.invalid;
   try {
-    var ctx = getAudio();
-    s.freqs.forEach(function (freq, i) {
-      var osc = ctx.createOscillator(), g = ctx.createGain();
-      osc.connect(g); g.connect(ctx.destination);
-      osc.type = s.wave; osc.frequency.value = freq;
-      var t = ctx.currentTime + i * (s.dur + 0.02);
-      g.gain.setValueAtTime(s.vol, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + s.dur);
-      osc.start(t); osc.stop(t + s.dur + .05);
+    const ctx = getAudio();
+    freqs.forEach((f, i) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      o.type = wave; o.frequency.value = f;
+      const t = ctx.currentTime + i * (dur + .02);
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(.001, t + dur);
+      o.start(t); o.stop(t + dur + .05);
     });
-  } catch (e) { /* no audio — ignore */ }
+  } catch (e) { /* silent */ }
 }
 
-// ── UTILS ────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────
 
 function esc(s) {
   return String(s || '')
-    .replace(/&/g,  '&amp;')
-    .replace(/</g,  '&lt;')
-    .replace(/>/g,  '&gt;')
-    .replace(/"/g,  '&quot;');
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function setMsg(text, isError) {
+  const el = document.getElementById('vfMsg');
+  el.textContent = text;
+  if (isError) el.style.color = '#ff9999';
 }
