@@ -178,7 +178,6 @@ async function startCamera() {
     video.play().then(() => {
       overlay.classList.add('hide');
       vf.classList.add('on');
-      document.getElementById('scanBar').classList.add('scanning');
       initDecoder();
     }).catch(err => setMsg('Video play failed: ' + err.message, true));
   });
@@ -194,7 +193,6 @@ function stopCamera() {
   const video = document.getElementById('camVideo');
   video.srcObject = null;
   document.getElementById('viewfinder').classList.remove('on');
-  document.getElementById('scanBar').classList.remove('scanning');
   document.getElementById('vfOverlay').classList.remove('hide');
   setMsg('Starting camera…');
 }
@@ -344,7 +342,6 @@ function verify(rawNIC) {
   refreshStats();
   beep('valid');
   flashVF('green');
-  flashBar('green');
   pushLog('valid', person.name || rawNIC, rawNIC, time);
   S.log.push({ type:'valid', nic:rawNIC, name:person.name, gate:S.gate, ts:now.toISOString() });
   openPopup('valid', '✓', 'Admitted', buildRows(person, rawNIC, S.gate, time));
@@ -370,27 +367,6 @@ function flashVF(color) {
   void vf.offsetWidth;   // force reflow
   vf.classList.add('flash-' + color);
   setTimeout(() => vf.classList.remove('flash-' + color), 400);
-}
-
-// ── Scan bar flash ───────────────────────────────────────────
-
-function flashBar(color) {
-  const bar  = document.getElementById('scanBar');
-  const fill = document.getElementById('scanBarFill');
-  const colorMap = { green: 'var(--green-b)', amber: 'var(--amber-b)', red: 'var(--red-b)' };
-  bar.classList.remove('scanning');
-  fill.style.background = colorMap[color] || colorMap.green;
-  fill.style.left   = '0';
-  fill.style.width  = '100%';
-  fill.style.transition = 'none';
-  // After 400ms flash, go back to sweeping
-  setTimeout(() => {
-    fill.style.background = '';
-    fill.style.left  = '';
-    fill.style.width = '';
-    fill.style.transition = '';
-    bar.classList.add('scanning');
-  }, 400);
 }
 
 // ── Popup ────────────────────────────────────────────────────
