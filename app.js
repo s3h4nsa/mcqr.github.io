@@ -18,7 +18,7 @@ const S = {
   log:       [],
   locked:    false,
   paused:    false,
-  popTimer:  null,
+  lastSeen:  null,     // last raw value seen (confirmation check)
   stream:    null,        // MediaStream
   rafId:     null,        // requestAnimationFrame handle
   detector:  null,        // BarcodeDetector instance (if supported)
@@ -295,11 +295,33 @@ function jsqrLoop() {
 
 function onQRFound(raw) {
   if (S.locked) return;
-  S.locked = true;
-  setTimeout(() => S.locked = false, 2500);
 
   const nic = raw.trim();
-  console.log('[SCAN] Found:', nic);
+
+  // ── Guard 1: minimum length (Sri Lankan NIC = 9+V or 12 digits)
+  if (nic.length < 9) {
+    S.lastSeen = null;
+    return;
+  }
+
+  // ── Guard 2: only alphanumeric + dash (reject garbage noise)
+  if (!/^[A-Za-z0-9\-]+$/.test(nic)) {
+    S.lastSeen = null;
+    return;
+  }
+
+  // ── Guard 3: confirmation — same value must appear 2 frames in a row
+  // This eliminates single-frame false positives from jsQR noise
+  if (nic !== S.lastSeen) {
+    S.lastSeen = nic;
+    return;   // wait for next frame to confirm
+  }
+
+  // Confirmed — lock and process
+  S.lastSeen = null;
+  S.locked = true;
+
+  console.log('[SCAN] Confirmed:', nic);
   verify(nic);
 }
 
@@ -413,8 +435,8 @@ function togglePause() {
 // ── Popup ────────────────────────────────────────────────────
 
 function openPopup(type, icon, status, rows) {
-  clearTimeout(S.popTimer);
-  pauseScan();
+  // Fully stop the camera — stream tracks off, loop cancelled
+  stopCamera();
 
   document.getElementById('popupIcon').textContent   = icon;
   document.getElementById('popupStatus').textContent = status;
@@ -434,16 +456,16 @@ function openPopup(type, icon, status, rows) {
   void fill.offsetWidth;   // force reflow
   fill.classList.add('running');
 
-  S.popTimer = setTimeout(closePopup, 4000);
 }
 
 function closePopup() {
-  clearTimeout(S.popTimer);
   document.getElementById('popupOverlay').classList.remove('show');
-  if (!S.paused) resumeScan();
+  // Restart camera only if not manually paused
+  if (!S.paused) {
+    startCamera();
+  }
 }
 
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closePopup(); });
 
 // ── Scan log ─────────────────────────────────────────────────
 
