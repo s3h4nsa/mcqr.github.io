@@ -173,14 +173,16 @@ async function startCamera() {
 
   video.srcObject = S.stream;
 
-  // Wait for video to actually be playing before we start decoding
-  video.addEventListener('loadedmetadata', () => {
+  // Use assignment (not addEventListener) so it always fires on re-start.
+  // Then call video.load() to force the event even if srcObject was set before.
+  video.onloadedmetadata = () => {
     video.play().then(() => {
       overlay.classList.add('hide');
       vf.classList.add('on');
       initDecoder();
     }).catch(err => setMsg('Video play failed: ' + err.message, true));
-  });
+  };
+  video.load();
 }
 
 function stopCamera() {
