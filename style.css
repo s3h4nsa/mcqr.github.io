@@ -503,11 +503,7 @@ body {
 .dvalue.err   { color: var(--err); font-style: italic; }
 
 /* Auto-dismiss bar */
-.popup-bar {
-  width: 100%; height: 2px;
-  background: rgba(255,255,255,.08);
-  border-radius: 1px; overflow: hidden; margin-top: 2px;
-}
+.popup-bar { display: none; }
 .popup-bar-fill { height: 100%; width: 100%; border-radius: 1px; }
 .popup-sheet.valid   .popup-bar-fill { background: var(--ok); }
 .popup-sheet.dupe    .popup-bar-fill { background: var(--warn); }
